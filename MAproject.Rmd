@@ -1,0 +1,169 @@
+---
+title: "Marketing Analytics"
+output: pdf_document
+urlcolor: blue
+graphics: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, message = FALSE,
+                      fig.width = 6, fig.height = 4.5, fig.align = "right")
+```
+
+```{r}
+library(bit64)
+library(data.table)
+library(glmnet)
+library(ranger)
+library(ggplot2)
+library(corrplot)
+library(knitr)
+library(tree)
+library(reprtree)
+library(party)
+```
+
+\setlength{\parskip}{6pt}
+
+```{r, results = "hide"}
+
+reviews_Full = fread("C:/A Pragyan/Rprograms/Marketing Analytics/Project/Reviews.csv")
+names(reviews_Full)
+summary(reviews_Full)
+crm_Full = fread("C:/A Pragyan/Rprograms/Marketing Analytics/Project/bigram_summary.csv")
+crm_DT = crm_Full
+#crm_DT = crm_DT[runif(.N) <.20]   # This creates a subset of the original data for testing/development
+
+```
+
+We split the sample into a 50 percent training and 50 percent validation sample. To ensure that we all have the same training and validation sample, use the following seed:
+
+```{r, results = "hide"}
+set.seed(1999)
+crm_DT[, training_sample := rbinom(nrow(crm_DT), 1, 0.7)]
+
+crm_DT[, c('Id','ProductId','UserId','ProfileName','HelpfulnessNumerator','Time','Summary','Text','Perc_helpfulness'):=NULL] 
+
+#table(crm_DT$Useful > 0)/nrow(crm_DT)
+
+```
+
+```{r}
+summary(crm_DT$Useful)
+```
+
+#### LOGISTICS LASSO
+
+```{r, results = "hide"}
+X1 = model.matrix(Useful ~ 0 + . - training_sample,
+                 data = crm_DT[training_sample == 1])
+y1 = crm_DT[training_sample == 1, Useful]
+
+#fit_LASSO_log = cv.glmnet(x = X1, y = y1, alpha = 1.0, family = "binomial")
+
+myCoefs = coef(fit_LASSO_log, s = "lambda.1se")
+myCoefs@Dimnames[[1]][which(myCoefs != 0 )] 
+myResults = data.table( features = myCoefs@Dimnames[[1]][ which(myCoefs != 0 ) ], 
+                         coefs = myCoefs [ which(myCoefs != 0 ) ] )
+
+predict_DT = crm_DT[training_sample == 0]
+X_new = model.matrix(Useful ~ 0 + . - training_sample,
+                     data = crm_DT[training_sample == 0])
+
+predict_DT[, y_LASSO := predict(fit_LASSO_log, newx = X_new, s = "lambda.1se", type="response")]
+
+y_actual = predict_DT[, Useful]
+y_predicted = predict_DT[, y_LASSO]
+y_predicted[y_predicted>0.7] <- 1
+y_predicted[y_predicted<=0.7] <- 0
+
+confusionMatrix <- table(pred=y_predicted,true=y_actual)
+accuracy <- 100*(sum(diag(confusionMatrix))/length(y_predicted))
+mse_LASSO = mean((predict_DT$y_LASSO - predict_DT$Useful)^2)
+
+plot(fit_LASSO_log)
+
+write.csv(myResults, "C:/A Pragyan/Rprograms/Marketing Analytics/Project/myResults_1se.csv")
+
+```
+
+#### Random forest
+
+```{r, cache = TRUE, results = "hide"}
+
+Forest_File = fread("C:/A Pragyan/Rprograms/Marketing Analytics/Project/top_features.csv")
+library(randomForest)
+set.seed(1999)
+Forest_File[, training_sample := rbinom(nrow(crm_DT), 1, 0.7)]
+names(Forest_File) <- gsub(" ", "_", names(Forest_File))
+
+Foresttraining  = Forest_File[training_sample==1, -c("training_sample", "V1")]
+Foresttest  = Forest_File[training_sample==0, -c("training_sample", "V1")]
+
+rf1 <- randomForest(Useful~., data=Foresttraining, mtry=2, ntree=500,importance=TRUE)
+randomforest_result = importance(rf1,type=1)
+
+rf1.predict<-predict(rf1, Foresttest, type = 'response')
+MSE.rf <- sum((rf1.predict - Foresttest$Useful)^2)/length(Foresttest$Useful)
+
+x<- ctree(Useful ~ ., data =Foresttraining )
+plot(x, type="simple", controls = ctree_control(maxdepth = 2))
+
+
+
+#####
+
+fit_rf = ranger(Useful ~ .,
+data = Foresttraining,
+num.trees = 1000,
+seed = 204)
+
+predict_ranger = predict(fit_rf, data = Foresttest)
+
+
+predict_DT1[, y_rf := predict_ranger$predictions]
+
+MSE.rf <- ((predict_ranger - Foresttest$Useful)^2)
+
+mse_rf    = mean((randomforest_result$y_rf - Foresttraining$Useful)^2)
+randomforest_result
+
+####
+
+write.csv(randomforest_result, "C:/A Pragyan/Rprograms/Marketing Analytics/Project/randomforest_result.csv")
+
+Top15Features = fread("C:/A Pragyan/Rprograms/Marketing Analytics/Project/Top15.csv")
+
+ggplot(Top15Features, aes(x=reorder(Features, percentIncreaseMSE ),y=percentIncreaseMSE, 
+                          fill = Features)) + geom_bar(stat="identity", position = "dodge", show.legend = F) +
+  xlab("Features") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + coord_flip()
+
+
+```
+
+```{r, results = "hide"}
+
+Foresttest1  = Forest_File[training_sample==0, -c("training_sample", "V1")]
+
+fit_rf = ranger(Useful ~ . - training_sample,
+                data = Forest_File[training_sample == 1],
+                num.trees = 1000,
+                seed = 204)
+
+predict_rf1 = predict(fit_rf, data = Foresttest1)
+
+Foresttest[, y_rf1 := predict_rf1$predictions]
+
+predict_DT1 = Forest_File[training_sample == 0]
+predict_ranger = predict(fit_rf, data = predict_DT)
+predict_DT1[, y_rf := predict_ranger$predictions]
+
+mse_rf    = mean((predict_DT1$y_rf - predict_DT1$Useful)^2)
+
+
+```
+
+
+
